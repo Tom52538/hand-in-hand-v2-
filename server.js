@@ -457,6 +457,6 @@ app.get('/employees', (req, res) => {
 // --------------------------
 // Server starten
 // --------------------------
-app.listen(port, () => {
-  console.log(`Server läuft auf http://localhost:${port}`);
+app.listen(port, "0.0.0.0", () => {
+  console.log(`Server läuft auf http://0.0.0.0:${port}`);
 });
