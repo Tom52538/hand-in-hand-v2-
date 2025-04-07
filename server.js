@@ -8,7 +8,7 @@ const port = process.env.PORT || 3000;
 
 // Middleware
 app.use(bodyParser.json());
-app.use(express.static('public'));  // Statische Dateien aus dem "public"-Verzeichnis
+app.use(express.static('public'));
 
 // Session-Middleware konfigurieren
 app.use(session({
@@ -24,7 +24,12 @@ const db = new Pool({
   ssl: { rejectUnauthorized: false }
 });
 
-// Tabelle work_hours erstellen
+/**
+ * Tabelle work_hours:
+ * - starttime und endtime als TIME (klein geschrieben in der DB).
+ * Tabelle employees:
+ * - enthält Sollstunden pro Wochentag
+ */
 db.query(`
   CREATE TABLE IF NOT EXISTS work_hours (
     id SERIAL PRIMARY KEY,
@@ -38,7 +43,6 @@ db.query(`
   );
 `).catch(err => console.error("Fehler beim Erstellen der Tabelle work_hours:", err));
 
-// Tabelle employees erstellen
 db.query(`
   CREATE TABLE IF NOT EXISTS employees (
     id SERIAL PRIMARY KEY,
@@ -62,17 +66,28 @@ function isAdmin(req, res, next) {
   }
 }
 
-// Hilfsfunktionen
+// --------------------------
+// Hilfsfunktionen für Zeitformatierung
+// --------------------------
+/**
+ * parseTime("HH:MM") -> Anzahl Minuten seit 00:00
+ */
 function parseTime(timeStr) {
   const [hh, mm] = timeStr.split(':');
   return parseInt(hh, 10) * 60 + parseInt(mm, 10);
 }
 
+/**
+ * calculateWorkHours("HH:MM", "HH:MM") -> Anzahl Stunden als Zahl (z. B. 7.5)
+ */
 function calculateWorkHours(startTime, endTime) {
   const diffInMin = parseTime(endTime) - parseTime(startTime);
-  return diffInMin / 60;
+  return diffInMin / 60; // Stunden
 }
 
+/**
+ * Ermittelt anhand des Wochentags die Soll-Stunden (aus employees.*_hours)
+ */
 function getExpectedHours(row, dateStr) {
   const d = new Date(dateStr);
   const day = d.getDay(); // 0=So, 1=Mo, ...
@@ -84,6 +99,12 @@ function getExpectedHours(row, dateStr) {
   return 0;
 }
 
+/**
+ * CSV-Funktion mit den Spalten:
+ * 1. Name, 2. Datum, 3. Arbeitsbeginn, 4. Arbeitsende,
+ * 5. Pause (Minuten), 6. Soll-Arbeitszeit, 7. Ist-Arbeitszeit,
+ * 8. Differenz, 9. Bemerkung
+ */
 function convertToCSV(data) {
   if (!data || data.length === 0) return '';
   
@@ -101,16 +122,24 @@ function convertToCSV(data) {
   ].join(','));
 
   for (const row of data) {
-    const dateFormatted = row.date ? new Date(row.date).toLocaleDateString("de-DE") : "";
+    const dateFormatted = row.date
+      ? new Date(row.date).toLocaleDateString("de-DE")
+      : "";
+    
+    // Hier greifen wir auf die konsistenten Felder zu:
     const startTimeFormatted = row.startTime || "";
-    const endTimeFormatted = row.endTime || "";
+    const endTimeFormatted   = row.endTime   || "";
+
+    // break_time ist in Stunden gespeichert, daher * 60 für Minuten
     const breakMinutes = (row.break_time * 60).toFixed(0);
     const istHours = row.hours || 0;
     const expected = getExpectedHours(row, row.date);
     const diff = istHours - expected;
+
     const istFormatted = istHours.toFixed(2);
     const expectedFormatted = expected.toFixed(2);
     const diffFormatted = diff.toFixed(2);
+
     const values = [
       row.name,
       dateFormatted,
@@ -127,7 +156,14 @@ function convertToCSV(data) {
   return csvRows.join('\n');
 }
 
+// --------------------------
 // API-Endpunkte für Arbeitszeiten (Admin)
+// --------------------------
+/**
+ * Liefert alle Einträge an den Admin.
+ * Hier wird TO_CHAR verwendet, um starttime und endtime als "HH24:MI" zurückzugeben,
+ * mit Alias "startTime" und "endTime".
+ */
 app.get('/admin-work-hours', isAdmin, (req, res) => {
   const query = `
     SELECT
@@ -147,6 +183,10 @@ app.get('/admin-work-hours', isAdmin, (req, res) => {
     .catch(err => res.status(500).send('Error fetching work hours.'));
 });
 
+/**
+ * CSV-Download
+ * Hier erfolgt ebenfalls die Umwandlung via TO_CHAR und die Aliasnamen werden angepasst.
+ */
 app.get('/admin-download-csv', isAdmin, (req, res) => {
   const query = `
     SELECT 
@@ -177,15 +217,22 @@ app.get('/admin-download-csv', isAdmin, (req, res) => {
     .catch(err => res.status(500).send('Error fetching work hours.'));
 });
 
+/**
+ * Update von Arbeitszeiten
+ */
 app.put('/api/admin/update-hours', isAdmin, (req, res) => {
   const { id, name, date, startTime, endTime, comment, breakTime } = req.body;
+
+  // Validierung: Arbeitsbeginn muss vor Arbeitsende liegen
   if (parseTime(startTime) >= parseTime(endTime)) {
     return res.status(400).json({ error: 'Arbeitsbeginn darf nicht später als Arbeitsende sein.' });
   }
+
   const totalHours = calculateWorkHours(startTime, endTime);
   const breakTimeMinutes = parseInt(breakTime, 10) || 0;
   const breakTimeHours = breakTimeMinutes / 60;
   const netHours = totalHours - breakTimeHours;
+
   const query = `
     UPDATE work_hours
     SET
@@ -203,6 +250,9 @@ app.put('/api/admin/update-hours', isAdmin, (req, res) => {
     .catch(err => res.status(500).send('Error updating working hours.'));
 });
 
+/**
+ * Löschen eines einzelnen Eintrags
+ */
 app.delete('/api/admin/delete-hours/:id', isAdmin, (req, res) => {
   const { id } = req.params;
   const query = 'DELETE FROM work_hours WHERE id = $1';
@@ -211,12 +261,20 @@ app.delete('/api/admin/delete-hours/:id', isAdmin, (req, res) => {
     .catch(err => res.status(500).send('Error deleting working hours.'));
 });
 
+// --------------------------
 // API-Endpunkte (öffentlicher Teil) zum Eintragen und Abfragen
+// --------------------------
+/**
+ * Neue Arbeitszeit eintragen
+ */
 app.post('/log-hours', (req, res) => {
   const { name, date, startTime, endTime, comment, breakTime } = req.body;
+
+  // Validierung: Arbeitsbeginn muss vor Arbeitsende liegen
   if (parseTime(startTime) >= parseTime(endTime)) {
     return res.status(400).json({ error: 'Arbeitsbeginn darf nicht später als Arbeitsende sein.' });
   }
+
   const checkQuery = `
     SELECT * FROM work_hours
     WHERE LOWER(name) = LOWER($1) AND date = $2
@@ -230,6 +288,7 @@ app.post('/log-hours', (req, res) => {
       const breakTimeMinutes = parseInt(breakTime, 10) || 0;
       const breakTimeHours = breakTimeMinutes / 60;
       const netHours = totalHours - breakTimeHours;
+
       const insertQuery = `
         INSERT INTO work_hours (name, date, hours, break_time, comment, starttime, endtime)
         VALUES ($1, $2, $3, $4, $5, $6, $7)
@@ -241,11 +300,15 @@ app.post('/log-hours', (req, res) => {
     .catch(err => res.status(500).send('Fehler beim Überprüfen der Daten.'));
 });
 
+/**
+ * Alle Arbeitszeiten einer Person abrufen
+ */
 app.get('/get-all-hours', (req, res) => {
   const { name } = req.query;
   if (!name) {
     return res.status(400).send('Name ist erforderlich.');
   }
+  // Hier ebenfalls TO_CHAR für die Zeitfelder mit konsistenten Aliasnamen
   const query = `
     SELECT
       id,
@@ -255,7 +318,7 @@ app.get('/get-all-hours', (req, res) => {
       break_time,
       comment,
       TO_CHAR(starttime, 'HH24:MI') AS "startTime",
-      TO_CHAR(endtime, 'HH24:MI') AS "endTime"
+      TO_CHAR(endtime,   'HH24:MI') AS "endTime"
     FROM work_hours
     WHERE LOWER(name) = LOWER($1)
     ORDER BY date ASC
@@ -265,6 +328,9 @@ app.get('/get-all-hours', (req, res) => {
     .catch(err => res.status(500).send('Fehler beim Abrufen der Daten.'));
 });
 
+/**
+ * Spezifische Arbeitszeit (Tag) einer Person abrufen
+ */
 app.get('/get-hours', (req, res) => {
   const { name, date } = req.query;
   const query = `
@@ -276,7 +342,7 @@ app.get('/get-hours', (req, res) => {
       break_time,
       comment,
       TO_CHAR(starttime, 'HH24:MI') AS "startTime",
-      TO_CHAR(endtime, 'HH24:MI') AS "endTime"
+      TO_CHAR(endtime,   'HH24:MI') AS "endTime"
     FROM work_hours
     WHERE LOWER(name) = LOWER($1)
       AND date = $2
@@ -291,6 +357,9 @@ app.get('/get-hours', (req, res) => {
     .catch(err => res.status(500).send('Fehler beim Abrufen der Daten.'));
 });
 
+/**
+ * Gesamte Tabelle work_hours löschen (mit Admin-Passwort)
+ */
 app.delete('/delete-hours', (req, res) => {
   const { password, confirmDelete } = req.body;
   if (password === 'admin' && (confirmDelete === true || confirmDelete === 'true')) {
@@ -303,6 +372,9 @@ app.delete('/delete-hours', (req, res) => {
   }
 });
 
+// --------------------------
+// Admin-Login
+// --------------------------
 app.post('/admin-login', (req, res) => {
   const { password } = req.body;
   if (password === 'admin') {
@@ -313,6 +385,9 @@ app.post('/admin-login', (req, res) => {
   }
 });
 
+// --------------------------
+// API-Endpunkte für Mitarbeiterverwaltung (admin-geschützt)
+// --------------------------
 app.get('/admin/employees', isAdmin, (req, res) => {
   const query = 'SELECT * FROM employees';
   db.query(query, [])
@@ -371,6 +446,7 @@ app.delete('/admin/employees/:id', isAdmin, (req, res) => {
     .catch(err => res.status(500).send('Fehler beim Löschen des Mitarbeiters.'));
 });
 
+// Öffentlich: Nur die Namen und IDs
 app.get('/employees', (req, res) => {
   const query = 'SELECT id, name FROM employees';
   db.query(query, [])
@@ -378,12 +454,9 @@ app.get('/employees', (req, res) => {
     .catch(err => res.status(500).send('Fehler beim Abrufen der Mitarbeiter.'));
 });
 
-// Neu: Root-Route, um sicherzustellen, dass die App reagiert
-app.get("/", (req, res) => {
-  res.send("🚀 Testversion läuft!");
-});
-
-// Server starten und auf allen Schnittstellen lauschen
-app.listen(port, "0.0.0.0", () => {
-  console.log(`Server läuft auf http://0.0.0.0:${port}`);
+// --------------------------
+// Server starten
+// --------------------------
+app.listen(port, () => {
+  console.log(`Server läuft auf http://localhost:${port}`);
 });
